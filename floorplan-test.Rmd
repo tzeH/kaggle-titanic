@@ -1,0 +1,369 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(patchwork)
+library(magick)
+image_read("floors.svg") |> image_ggplot()
+```
+
+Now we extract the cabins from the floor plan.
+
+```{r}
+library(xml2)
+
+svg <- read_xml("floors_no_img.svg")
+rects <- xml_find_all(svg, ".//d1:rect")
+
+deck_levels <- c("A", "B", "C", "D", "E", "F", "G")
+
+fileToMeters <- 28.2 / 113
+
+floorplan_df <- data.frame(
+  id     = xml_attr(rects, "id"),
+  Cabin   = xml_attr(rects, "label"),
+  Deck   = factor(substr(xml_attr(rects, "label"), 1, 1), levels=deck_levels),
+  x      = as.numeric(xml_attr(rects, "x")),
+  y      = -as.numeric(xml_attr(rects, "y"))-as.numeric(xml_attr(rects, "height")),
+  width  = as.numeric(xml_attr(rects, "width")),
+  height = as.numeric(xml_attr(rects, "height")),
+  size   = as.numeric(xml_attr(rects, "height")) * as.numeric(xml_attr(rects, "width")),
+  stringsAsFactors = FALSE
+)
+
+```
+
+And draw it
+
+```{r, fig.height=4, fig.width=15}
+library(ggplot2)
+
+ggplot(floorplan_df) + 
+  geom_rect(aes(xmin=x, xmax=x+width, ymin=y, ymax=y+height, col=Deck), fill="white", alpha=0.5) +
+  geom_text(aes(x=x+width/2, y=y+height/2, label=Cabin))
+```
+
+Wie viel Kabinendaten haben wir?
+
+```{r}
+
+embarked_levels <- c("C", "Q", "S")
+
+training_df <- read.csv2("data/train.csv", sep = ",")
+testing_df <- read.csv2("data/test.csv", sep = ",")
+
+training_df$Age <- as.numeric(training_df$Age)
+testing_df$Age <- as.numeric(testing_df$Age)
+training_df$Fare <- as.numeric(training_df$Fare)
+testing_df$Fare <- as.numeric(testing_df$Fare)
+training_df$Embarked <- factor(training_df$Embarked, levels=embarked_levels)
+testing_df$Embarked <- factor(testing_df$Embarked, levels=embarked_levels)
+
+all_df <- rbind(training_df, cbind(testing_df, Survived=NA))
+
+paste0("Allgemein N=", nrow(training_df), " Survived=", mean(training_df[,"Survived"]))
+paste0("Mit Kabine N=", sum(training_df$Cabin != ""), " Survived=", mean(training_df[training_df$Cabin != "","Survived"]))
+paste0("Ohne Kabine N=", sum(training_df$Cabin == ""), " Survived=", mean(training_df[training_df$Cabin == "","Survived"]))
+
+```
+
+Jetzt zeichen wir ein, was wir über die Kabinen wissen
+
+```{r, fig.height=4, fig.width=15}
+library(ggplot2)
+library(dplyr)
+library(plotly)
+
+cabin_people_ungrouped_df <- floorplan_df %>%
+  left_join(all_df, by = c("Cabin" = "Cabin")) %>%
+  group_by(Cabin)
+
+cabin_people_df <- cabin_people_ungrouped_df %>%
+  group_by(Cabin, Deck) %>%
+  filter(!is.na(PassengerId)) %>%
+  summarise(
+    Survived = mean(Survived, na.rm = TRUE),
+    x = mean(x),
+    y = mean(y),
+    height = mean(height),
+    width = mean(width),
+    size = mean(size),
+    Pclass = mean(Pclass),
+    Fare = mean(Fare),
+    Age = mean(Age),
+    SibSp = mean(SibSp),
+    Parch = mean(Parch),
+    Embarked = mean(as.numeric(Embarked), rm.na=TRUE),
+    .groups = "drop"
+  )
+
+# missing_cabins <- all_df %>%
+#   filter(Cabin != "") %>%
+#   left_join(floorplan_df, by = c("Cabin" = "Cabin")) %>%
+#   filter(is.na(id)) %>%
+#   # filter(substr(Cabin,1,1) == "C") %>%
+#   select(Cabin) %>%
+#   arrange(Cabin)
+# 
+# missing_cabins
+
+ggplot(cabin_people_df) + 
+  geom_rect(aes(xmin=x, xmax=x+width, ymin=-y-height, ymax=-y, fill=Survived), alpha=0.25) +
+  labs(title="Überlebenswahrscheinlichkeit in 2D")
+
+ggplot(cabin_people_df, aes(x=size, y=Fare)) + 
+  geom_point(aes(col=factor(Pclass))) +
+  geom_smooth(aes(col=factor(Pclass)), method='lm', formula = y ~ x) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(title="Kabinengröße vs Preis")
+
+graph_plotly_df <- cabin_people_df[!is.na(cabin_people_df$Survived),]
+plot_ly(
+  x=graph_plotly_df$x+graph_plotly_df$width/2,
+  y=graph_plotly_df$y+graph_plotly_df$height/2,
+  z=-as.numeric(graph_plotly_df$Deck),
+  type="scatter3d", mode="markers", color=graph_plotly_df$Survived) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "X Axis", range = c(200, 900)),  # set min and max
+      yaxis = list(title = "Y Axis", range = c(-500, 200)),  # set min and max
+      zaxis = list(title = "Z Axis", range = c(-10, 10))   # set min and max
+    ),
+    title = 'Überlebenswahrscheinlichkeit je Kabine'
+  )
+
+graph_plotly_df <- cabin_people_df[!is.na(cabin_people_df$Pclass),]
+plot_ly(
+  x=graph_plotly_df$x+graph_plotly_df$width/2,
+  y=graph_plotly_df$y+graph_plotly_df$height/2,
+  z=-as.numeric(graph_plotly_df$Deck),
+  type="scatter3d", mode="markers", color=graph_plotly_df$Pclass) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "X Axis", range = c(200, 900)),  # set min and max
+      yaxis = list(title = "Y Axis", range = c(-500, 200)),  # set min and max
+      zaxis = list(title = "Z Axis", range = c(-10, 10))   # set min and max
+    ),
+    title = 'Klasse je Kabine'
+  )
+
+graph_plotly_df <- cabin_people_df[cabin_people_df$Fare > 0,]
+plot_ly(
+  x=graph_plotly_df$x+graph_plotly_df$width/2,
+  y=graph_plotly_df$y+graph_plotly_df$height/2,
+  z=-as.numeric(graph_plotly_df$Deck),
+  type="scatter3d", mode="markers", color=log(graph_plotly_df$Fare)) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "X Axis", range = c(200, 900)),  # set min and max
+      yaxis = list(title = "Y Axis", range = c(-500, 200)),  # set min and max
+      zaxis = list(title = "Z Axis", range = c(-10, 10))   # set min and max
+    ),
+    title = 'log-Preis je Kabine'
+  )
+
+graph_plotly_df <- cabin_people_df[cabin_people_df$Embarked > 0,]
+plot_ly(
+  x=graph_plotly_df$x+graph_plotly_df$width/2,
+  y=graph_plotly_df$y+graph_plotly_df$height/2,
+  z=-as.numeric(graph_plotly_df$Deck),
+  type="scatter3d", mode="markers", color=graph_plotly_df$Embarked) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "X Axis", range = c(200, 900)),  # set min and max
+      yaxis = list(title = "Y Axis", range = c(-500, 200)),  # set min and max
+      zaxis = list(title = "Z Axis", range = c(-10, 10))   # set min and max
+    ),
+    title = 'Einstieg je Kabine'
+  )
+
+all_df
+```
+
+Prepare Input Data for Gaussian Process Model:
+
+```{r}
+input_df <- training_df %>%
+  left_join(floorplan_df, by = c("Cabin" = "Cabin")) %>%
+  filter(!is.na(id)) %>%
+  mutate(z=-as.numeric(Deck) * 4.0) %>%
+  mutate(x=(x+width/2) * fileToMeters) %>%
+  mutate(y=(y+height/2) * fileToMeters)
+
+input_all_df <- training_df %>%
+  left_join(floorplan_df, by = c("Cabin" = "Cabin")) %>%
+  mutate(z=-as.numeric(Deck) * 4.0) %>%
+  mutate(x=(x+width/2) * fileToMeters) %>%
+  mutate(y=(y+height/2) * fileToMeters) %>%
+  mutate(has_deck=1 * (!is.na(id))) %>%
+  mutate(Age=as.numeric(Age)) %>%
+  mutate(Sex=as.numeric(factor(Sex))) %>%
+  mutate(Pclass=as.numeric(Pclass))
+input_all_df[input_all_df$has_deck == 0, c("x","y","z")] <- c(0,0,0)
+```
+
+Run a classical gp (or tp) model
+
+```{r}
+library(mgcv)
+
+
+# Fit a classical GP for binary outcome using logit link
+fit_classical <- gam(#Survived ~ s(x, y, z, bs = "gp", k = 15),
+                     Survived ~ s(x, y, z, bs = "tp", k = 15),
+                     data = input_df,
+                     family = binomial(link = "logit"))  # Bernoulli logistic model
+
+# Summarize the model
+summary(fit_classical)
+
+# Plot the GP smooth effect
+plot(fit_classical, scheme = 2, too.far = 0.1)
+
+
+grid <- expand.grid(
+  x = seq(min(input_df$x), max(input_df$x), length.out = 30),
+  y = seq(min(input_df$y), max(input_df$y), length.out = 5),
+  z = seq(min(input_df$z), max(input_df$z), length.out = 7)
+)
+grid$prob <- predict(fit_classical, newdata = grid, type = "response")
+
+plot_ly(
+  x=grid$x,
+  y=grid$y,
+  z=grid$z,
+  type="scatter3d", mode="markers", color=grid$prob) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "X Axis", range = c(100, 230)),  # set min and max
+      yaxis = list(title = "Y Axis", range = c(-80, 50)),  # set min and max
+      zaxis = list(title = "Z Axis", range = c(-70, 60))   # set min and max
+    )
+  )
+
+```
+
+Run a classical mixed model
+
+```{r}
+library(mgcv)
+
+
+# Fit a classical GP for binary outcome using logit link
+fit_classical <- gam(#Survived ~ s(x, y, z, bs = "gp", by = has_deck, k = 45) + s(Age, Sex, bs = "gp", k = 5) + Pclass,
+                     #Survived ~ s(x, y, z, bs = "tp", by = has_deck, k = 15) + s(Age, Sex, bs = "gp", k = 5) + Pclass,
+                     Survived ~ s(x, y, z, bs = "tp", by = has_deck, k = 15) + s(Age, Sex, bs = "gp", k = 5),
+                     data = input_all_df,
+                     family = binomial(link = "logit"))  # Bernoulli logistic model
+
+# Summarize the model
+summary(fit_classical)
+
+# Plot the GP smooth effect
+plot(fit_classical, scheme = 2, too.far = 0.1)
+
+
+grid <- expand.grid(
+  x = seq(min(input_all_df$x, na.rm = TRUE), max(input_all_df$x, na.rm = TRUE), length.out = 30),
+  y = seq(min(input_all_df$y, na.rm = TRUE), max(input_all_df$y, na.rm = TRUE), length.out = 5),
+  z = seq(min(input_all_df$z, na.rm = TRUE), max(input_all_df$z, na.rm = TRUE), length.out = 7)
+)
+grid$has_deck <- 1.0
+grid$Age <- median(input_all_df$Age, na.rm = TRUE)
+grid$Sex <- median(input_all_df$Sex, na.rm = TRUE)
+grid$Pclass <- median(input_all_df$Pclass, na.rm = TRUE)
+grid$prob <- predict(fit_classical, newdata = grid, type = "response")
+
+plot_ly(
+  x=grid$x,
+  y=grid$y,
+  z=grid$z,
+  type="scatter3d", mode="markers", color=grid$prob) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "X Axis", range = c(100, 230)),  # set min and max
+      yaxis = list(title = "Y Axis", range = c(-80, 50)),  # set min and max
+      zaxis = list(title = "Z Axis", range = c(-70, 60))   # set min and max
+    )
+  )
+
+```
+
+Run a bayesian gp model
+
+```{r}
+
+library(brms)
+library(tidyverse)
+
+options(
+  mc.cores = 6
+)
+
+# Define a Gaussian Process formula
+# We'll use a 3D spatial GP over s, x, z
+formula <- bf(Survived ~ gp(x, y, z, k = 15)) # Gaussian Process
+#formula <- bf(Survived ~ gp(x, y, z, k = 15) + gp(Age, Sex, k = 5)) # Gaussian Process
+# formula <- bf(Survived ~ s(x, y, z, k = 15)) # Thin plate Splines
+# k = number of basis functions; adjust for complexity / speed
+
+# Fit the GP model
+fit_bayes <- brm(
+  formula,
+  data = input_df,
+  family = bernoulli(),
+  iter = 2000
+  # prior = set_prior("constant(0.38)", class = "Intercept")  # fix intercept
+)
+
+# Summarize results
+summary(fit_bayes)
+
+# Plot predicted GP effects (posterior probabilities)
+# plot(conditional_effects(fit_bayes))
+
+library(dplyr)
+library(tidyr)
+
+grid <- expand.grid(
+  x = seq(min(input_df$x), max(input_df$x), length.out = 30),
+  y = seq(min(input_df$y), max(input_df$y), length.out = 5),
+  z = seq(min(input_df$z), max(input_df$z), length.out = 7)
+)
+pred_probs <- posterior_epred(fit_bayes, newdata = grid, re_formula = NA)
+grid$prob <- apply(pred_probs, 2, mean)
+
+plot_ly(
+  x=grid$x,
+  y=grid$y,
+  z=grid$z,
+  type="scatter3d", mode="markers", color=grid$prob) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "X Axis", range = c(100, 230)),  # set min and max
+      yaxis = list(title = "Y Axis", range = c(-80, 50)),  # set min and max
+      zaxis = list(title = "Z Axis", range = c(-70, 60))   # set min and max
+    )
+  )
+
+```
+
+
+## Tutorial 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
