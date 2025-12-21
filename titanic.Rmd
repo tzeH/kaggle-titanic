@@ -1,0 +1,475 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+Welcome to my Titanic notebook. I have two Points to try here:
+
+1. Use the floor-plans to get actual 3D-Information about the Cabins
+2. Use increasingly more accurate Bayesian Modelling, to see if it helps.
+
+But first I'll build a baseline, that incorporate all the "usual" features, used by successful participants. Most of them I found myself, but the Name-Processing was something I completely missed.
+Full credit for that goes to all the other participants.
+
+```{r}
+
+library(brms) # Bayesian
+library(mgcv) # Non-Bayesian
+library(parallelly)
+
+options(
+  mc.cores = availableCores()
+)
+
+```
+
+# Model Evaluation
+
+We'll evaluate all Modes with 5 fold cross validation.
+
+```{r}
+evaluate_brms_model <- function(fit) {
+  # fit_loo <- loo(fit, moment_match = TRUE)
+  fit_kfold <- kfold(fit, chains = 1, save_fits = TRUE, folds = all_df[ITrain,"kfold"])
+  fit_preds <- kfold_predict(fit_kfold)
+  fit_accuracy <- mean(fit_preds$y == ifelse(colMeans(fit_preds$yrep) >= 0.5, 1, 0))
+  fit_full_accuracy <- mean(fit$data$Survived == ifelse(predict(fit)[,"Estimate"] >= 0.5, 1, 0))
+  
+  rbind(
+    #fit_loo$estimates, 
+    fit_kfold$estimates, data.frame(Estimate=fit_accuracy, SE=NA, row.names = "accuracy_kfold"), data.frame(Estimate=fit_full_accuracy, SE=NA, row.names = "accuracy"))
+}
+
+evaluate_gam_formula <- function(formula, data) {
+  train_df <- data[ITrain, ]
+  K <- max(train_df$kfold)
+  cv_pred <- vector("list", K)
+  cv_score <- numeric(K)
+  cv_score_mse <- numeric(K)
+  for (k in seq_len(K)) {
+    train_k <- train_df[train_df$kfold != k, ]
+    test_k  <- train_df[train_df$kfold == k, ]
+  
+    fit <- gam(
+      formula,
+      data = train_k,
+      family = binomial(link = "logit")
+    )
+  
+    pred <- predict(fit, newdata = test_k, type = "response")
+    
+    cv_pred[[k]] <- ifelse(pred >= 0.5, 1, 0)
+    cv_score[k] <- mean(test_k$Survived == cv_pred[[k]])  # Accuracy
+    cv_score_mse[k] <- mean((test_k$Survived - pred)^2)  # MSE
+  }
+  
+  fit <- gam(
+    formula,
+    data = train_df,
+    family = binomial(link = "logit")
+  )
+  fit_full_accuracy <- mean(fit$model$Survived == ifelse(inv_logit_scaled(predict(fit)) >= 0.5, 1, 0))
+  
+  formula_str <- deparse(formula, width.cutoff=500, nlines = 1)
+  rbind(
+    data.frame(formula=formula_str, Acc=fit_full_accuracy, KMeansAcc=mean(cv_score), KMeansAccSe=sd(cv_score), KMeansMse=mean(cv_score_mse), KMeansMseSe=sd(cv_score_mse))
+  )
+}
+
+write_gam_solution <- function(formula, full_data, filename) {
+  fit <- gam(
+    formula,
+    data = full_data[ITrain,],
+    family = binomial(link = "logit")
+  )
+  fit_prediction <- predict(fit, newdata=full_data[ITest,])
+  fit_solution <- data.frame(PassengerId = full_data[ITest,"PassengerId"], Survived=(fit_prediction >= 0.5) * 1)
+  
+  write.csv(fit_solution, file = filename, row.names = FALSE)
+}
+```
+
+# Feature Engineering
+
+I'm putting Test- and Training Data in one DF, so I can do all the feature Engineering in a simple way.
+Unknown Values are assigned "NA". All categorical data is turned into a factor.
+
+```{r}
+all_df <- rbind(read.csv2("data/train.csv", sep = ","), 
+                cbind(read.csv2("data/test.csv", sep = ","), Survived=NA))
+
+NTrain <- sum(!is.na(all_df$Survived))
+ITrain <- seq(1,NTrain)
+ITest <- seq(NTrain+1,nrow(all_df))
+
+all_df$kfold <- rep(1:5, 300)[1:nrow(all_df)]
+
+all_df$Age <- as.numeric(all_df$Age)
+all_df$Fare <- as.numeric(all_df$Fare)
+all_df$SibSp <- as.numeric(all_df$SibSp)
+all_df$Parch <- as.numeric(all_df$Parch)
+
+embarked_levels <- c("C", "Q", "S")
+all_df$Embarked <- factor(all_df$Embarked, levels=embarked_levels)
+
+sex_levels <- c("male", "female")
+all_df$Sex <- factor(all_df$Sex, levels=sex_levels)
+
+pclass_levels <- c("First", "Second", "Third")
+all_df$Pclass <- factor(all_df$Pclass, labels = pclass_levels)
+
+
+rbind(
+  evaluate_gam_formula(Survived ~ 1, all_df),
+  evaluate_gam_formula(Survived ~ Sex, all_df),
+  evaluate_gam_formula(Survived ~ Pclass, all_df)
+)
+```
+
+## Names
+
+As others have shown, the Title in the Name is very important for a good fit.
+Some also use the Surname as important feature. Therefore I'm including that as well.
+
+```{r}
+# All Titles, that exist in the training data at least two times
+title_levels <- c("Other", "Mr", "Miss", "Mrs", "Master", "Dr", "Rev", "Col", "Major", "Mlle")
+all_df$Title <- substring(all_df$Name,regexpr(",",all_df$Name)+2,regexpr("\\.",all_df$Name)-1)
+all_df$Title <- factor(all_df$Title, levels=title_levels)
+all_df$Title[is.na(all_df$Title)] <- "Other"
+
+# Careful to not use Test-Data, here as well
+all_df$Surname <- substring(all_df[, c("Name")],0,regexpr(",",all_df[, c("Name")])-1)
+all_df$Surname <- gsub("[ -]", "_", all_df$Surname)
+
+surname_levels <- all_df$Surname
+surname_levels <- unique(surname_levels[ ave(ITrain, surname_levels, FUN=length) > 1 ])
+surname_levels <- c("Other", surname_levels)
+
+all_df$Surname <- factor(substring(all_df[, c("Name")],0,regexpr(",",all_df[, c("Name")])-1), levels=surname_levels)
+all_df$Surname[is.na(all_df$Surname)] <- "Other"
+
+rbind(
+  evaluate_gam_formula(Survived ~ Title, all_df),
+  evaluate_gam_formula(Survived ~ Title*Sex, all_df)
+)
+# Surname schwierig, weil bei der cross-validation eingie Werte wegfallen
+# evaluate_gam_formula(Survived ~ Surname, all_df)
+```
+
+## Ticket String
+
+```{r}
+ticketPrefix_levels <- substring(all_df$Ticket,1,regexpr("[ ]",all_df$Ticket)-1)
+ticketPrefix_levels <- gsub("[/.]", "", ticketPrefix_levels)
+
+all_df$TicketPrefix <- ticketPrefix_levels
+
+ticketPrefix_levels <- ticketPrefix_levels[ITrain]
+ticketPrefix_levels <- unique(c("", "Other", ticketPrefix_levels[ ave(ITrain, ticketPrefix_levels, FUN=length) >= 1 ]))
+
+all_df$TicketPrefix <- factor(all_df$TicketPrefix, levels = ticketPrefix_levels)
+all_df$TicketPrefix[is.na(all_df$TicketPrefix)] <- "Other"
+
+# TicketPrefix schwierig, weil bei der cross-validation eingie Werte wegfallen
+# evaluate_gam_formula(Survived ~ TicketPrefix, all_df)
+```
+
+## Cabin String
+
+Sometimes we have multiple Cabins in one Strings. In these cases, the first one sometimes is missing a Number. We get rid by all that complexity by always taking the last one. The evenness can be interpreted as the ship's side.
+
+```{r}
+all_df$LastCabin <- substring(all_df$Cabin,regexpr(" [^ ]+$",all_df$Cabin)+1,length(all_df$Cabin)-1)
+
+deck_levels <- c("A", "B", "C", "D", "E", "F", "G", "T")
+all_df$Deck <- factor(substr(all_df$LastCabin,0,1), levels=deck_levels)
+all_df$CabinNr <- as.numeric(substring(all_df$LastCabin,2))
+all_df$CabinSide <- all_df$CabinNr %% 2
+
+# Deck schwierig, weil bei der cross-validation eingie Werte wegfallen
+# evaluate_gam_formula(Survived ~ Deck, all_df)
+evaluate_gam_formula(Survived ~ CabinNr + CabinSide, all_df)
+```
+
+## Embarked Imputation
+
+```{r}
+all_df$Embarked[is.na(all_df$Embarked)] <- "S"
+
+evaluate_gam_formula(Survived ~ Embarked, all_df)
+```
+
+## Fare Imputation
+
+```{r}
+fare_fit <- lm(formula = log(Fare+0.0001) ~ 0 + Pclass + SibSp + Parch + Embarked, data = all_df[ITrain,])
+
+all_df$Fare[is.na(all_df$Fare)] <- exp(predict(fare_fit, all_df[is.na(all_df$Fare),]))-0.0001
+all_df$LogFare <- log(1+all_df$Fare)
+
+fare_levels <- c("Free", "Cheap", "Regular", "Pricy", "Luxury")
+# Values based on Quantiles of training set
+all_df$FareBin <- ifelse(all_df$Fare == 0, "Free", ifelse(all_df$Fare <= 7.9, "Cheap", ifelse(all_df$Fare <= 14.5, "Regular", ifelse(all_df$Fare <= 31.3, "Pricy", "Luxury"))))
+all_df$FareBin <- factor(all_df$FareBin, levels = fare_levels)
+
+rbind(
+  evaluate_gam_formula(Survived ~ Fare, all_df),
+  evaluate_gam_formula(Survived ~ LogFare, all_df),
+  evaluate_gam_formula(Survived ~ FareBin, all_df)
+  )
+```
+
+## Age Imputation based on Title
+
+Binning makes sense, numerical age is useless then.
+
+```{r}
+age_fit <- lm(formula = log(Age) ~ 0 + Title + Pclass + SibSp + Parch + Fare + Embarked + Sex, data = all_df[ITrain,])
+
+all_df$AgeImputed <- all_df$Age
+all_df$AgeImputed[is.na(all_df$Age)] <- exp(predict(age_fit, all_df[is.na(all_df$Age),]))
+
+age_levels <- c("Infant", "Teenager", "Adult", "Old")
+all_df$AgeBin <- ifelse(all_df$AgeImputed <= 6, "Infant", ifelse(all_df$AgeImputed <= 18, "Teenager", ifelse(all_df$AgeImputed <= 60, "Adult", "Old")))
+all_df$AgeBin <- factor(all_df$AgeBin, levels = age_levels)
+
+rbind(
+  evaluate_gam_formula(Survived ~ AgeImputed, all_df),
+  evaluate_gam_formula(Survived ~ AgeBin, all_df),
+  evaluate_gam_formula(Survived ~ AgeImputed + AgeBin, all_df)
+  )
+```
+
+
+## Family Structure
+
+```{r}
+all_df$SoloTraveler <- ifelse(all_df$SibSp + all_df$Parch == 0, 1, 0)
+all_df$AdultWithInfant <- as.integer(ave(all_df$AgeBin == "Infant", all_df$Ticket, FUN = any) & all_df$AgeBin == "Adult")
+all_df$AdultWithBoy <- as.integer(ave(all_df$AgeBin == "Infant" & all_df$Sex == "male", all_df$Ticket, FUN = any) & all_df$AgeBin == "Adult")
+all_df$AdultWithTeenager <- as.integer(ave(all_df$AgeBin == "Teenager", all_df$Ticket, FUN = any) & all_df$AgeBin == "Adult")
+all_df$AdultWithOld <- as.integer(ave(all_df$AgeBin == "Old", all_df$Ticket, FUN = any) & all_df$AgeBin == "Adult")
+all_df$TicketTravelers <- as.integer(ave(rep(1,nrow(all_df)), all_df$Ticket, FUN = sum)) - 1
+
+all_df$Namesakes <- pmax( as.integer(ave(all_df$Surname != "Other", all_df$Surname, FUN = sum)) - 1, 0)
+
+rbind(
+  evaluate_gam_formula(Survived ~ SoloTraveler, all_df),
+  evaluate_gam_formula(Survived ~ AdultWithInfant, all_df),
+  evaluate_gam_formula(Survived ~ AdultWithTeenager, all_df),
+  evaluate_gam_formula(Survived ~ AdultWithOld, all_df),
+  evaluate_gam_formula(Survived ~ TicketTravelers, all_df),
+  evaluate_gam_formula(Survived ~ Namesakes, all_df),
+  evaluate_gam_formula(Survived ~ SoloTraveler + AdultWithInfant + AdultWithTeenager + AdultWithOld + TicketTravelers + Namesakes, all_df)
+  )
+
+rbind(
+  evaluate_gam_formula(Survived ~ Sex*SoloTraveler, all_df),
+  evaluate_gam_formula(Survived ~ Sex*AdultWithInfant, all_df),
+  evaluate_gam_formula(Survived ~ Sex*AdultWithTeenager, all_df),
+  evaluate_gam_formula(Survived ~ Sex*AdultWithOld, all_df),
+  evaluate_gam_formula(Survived ~ Sex*TicketTravelers, all_df),
+  evaluate_gam_formula(Survived ~ Sex*Namesakes, all_df),
+  evaluate_gam_formula(Survived ~ Sex + SoloTraveler + AdultWithInfant + AdultWithTeenager + AdultWithOld + TicketTravelers + Namesakes, all_df),
+  evaluate_gam_formula(Survived ~ Sex*Namesakes, all_df)
+  )
+
+rbind(
+  evaluate_gam_formula(Survived ~ Sex*Namesakes + SoloTraveler, all_df),
+  evaluate_gam_formula(Survived ~ Sex*Namesakes + AdultWithInfant, all_df),
+  evaluate_gam_formula(Survived ~ Sex*Namesakes + AdultWithTeenager, all_df),
+  evaluate_gam_formula(Survived ~ Sex*Namesakes + AdultWithOld, all_df),
+  evaluate_gam_formula(Survived ~ Sex*Namesakes + TicketTravelers, all_df),
+  evaluate_gam_formula(Survived ~ Sex*Namesakes + AdultWithInfant + AdultWithTeenager, all_df)
+  )
+```
+
+# Feature Selection
+
+LASSO-Implementation acc. to https://rpubs.com/Momo2019/1184100
+
+```{r}
+# install.packages("glmnet")
+library(glmnet)
+# install.packages("psych")
+library(psych)
+
+# glmnet(as.matrix(all_df[ITrain,c("AgeImputed", "Fare")]), as.matrix(all_df[ITrain,c("Survived")]))
+
+lasso.features = c("Pclass", "AgeImputed", "Fare", "LogFare", "Sex",
+                   "SibSp", "Parch", "SoloTraveler", "AdultWithInfant", "AdultWithBoy", "AdultWithTeenager", "AdultWithOld", "TicketTravelers", "Namesakes")
+lasso.X <- transform(all_df[,lasso.features], Sex=as.numeric(Sex), Pclass=as.numeric(Pclass))
+lasso.y <- all_df[,c("Survived")]
+
+# One-Hot encoded factors
+lasso.X <- cbind(
+  lasso.X,
+  dummy.code(all_df[,"AgeBin"], ),
+  dummy.code(all_df[,"FareBin"], ),
+  dummy.code(all_df[,"Embarked"], ),
+  dummy.code(all_df[,"Title"]),
+  dummy.code(all_df[,"Surname"]),
+  dummy.code(all_df[,"AgeBin"]),
+  dummy.code(all_df[,"TicketPrefix"])
+)
+
+cv.lasso = cv.glmnet(as.matrix(lasso.X[ITrain,]), as.matrix(lasso.y[ITrain]), alpha=1)
+plot(cv.lasso)
+best.lambda <- cv.lasso$lambda.min
+print(best.lambda)
+
+lasso.model <- glmnet(as.matrix(lasso.X[ITrain,]), as.matrix(lasso.y[ITrain]), alpha=1, lambda=best.lambda*3)
+lasso.coefs <- coef(lasso.model)
+lasso.selected <- rownames(lasso.coefs)[as.numeric(lasso.coefs) != 0.0]
+
+lasso.coefs
+
+f <- as.formula(
+  paste("Survived ~ ", paste(ifelse(lasso.selected == "(Intercept)", "1", lasso.selected), collapse = " + "))
+)
+
+lasso.gam_df <- cbind(Survived=lasso.y, all_df[, c("kfold", "PassengerId")], lasso.X)
+
+evaluate_gam_formula(f, lasso.gam_df[ITrain,])
+
+write_gam_solution(f, lasso.gam_df, "lasso.solution.csv") # 0.77751 (0.76555 ohne lambda * 3)
+
+```
+
+# Baseline Models
+
+Here we use all the simple Features in a bayesian regression model to establish a baseline:
+
+```{r}
+library(future)
+plan(multisession, workers = 5)
+
+
+```
+
+## Baseline 1
+```{r}
+baseline1_df <- all_df
+baseline1_df$Title <- as.character(baseline1_df$Title)
+baseline1_df[is.na(baseline1_df$Title) | baseline1_df$Title == "Dr" | baseline1_df$Title == "Col" | baseline1_df$Title == "Major" | baseline1_df$Title == "Mlle" | baseline1_df$Title == "Rev" | baseline1_df$Title == "Miss" | baseline1_df$Title == "Mrs",]$Title <- "NoTitle"
+
+baseline1_formula <- bf(Survived ~ Pclass + Embarked + AgeImputed + Sex + Title + SibSp + Parch + Fare) # TicketPrefix & Deck & Surname have NAs
+baseline1_fit <- brm(
+  baseline1_formula,
+  data = baseline1_df[ITrain,],
+  family = bernoulli(),
+  iter = 2000,
+  silent = FALSE,
+  refresh = 100
+)
+baseline1_evaluation <- evaluate_brms_model(baseline1_fit)
+baseline1_fit
+baseline1_evaluation
+
+baseline1_prediction <- predict(baseline1_fit, newdata=baseline1_df[ITest,])
+baseline1_solution <- data.frame(PassengerId = all_df[ITest,]$PassengerId, Survived=(baseline1_prediction[,"Estimate"] >= 0.5) * 1)
+
+write.csv(baseline1_solution, file = "baseline1.solution.csv", row.names = FALSE) # Test-Set: 0.76555
+```
+
+## Baseline 2
+
+```{r}
+baseline2_df <- baseline1_df
+baseline2_df$Deck <- as.character(baseline2_df$Deck)
+baseline2_df[is.na(baseline2_df$Deck) | baseline2_df$Deck == "G" | baseline2_df$Deck == "T",]$Deck <- "NoDeck"
+
+baseline2_formula <- bf(Survived ~ Pclass + Embarked + AgeImputed + Sex + Title + SibSp + Parch + Fare + Deck)
+baseline2_fit <- brm(
+  baseline2_formula,
+  data = baseline2_df[ITrain,],
+  family = bernoulli(),
+  iter = 2000
+)
+baseline2_evaluation <- evaluate_brms_model(baseline2_fit)
+baseline2_fit
+baseline2_evaluation
+
+baseline2_prediction <- predict(baseline2_fit, newdata=baseline2_df[ITest,])
+baseline2_solution <- data.frame(PassengerId = all_df[ITest,]$PassengerId, Survived=(baseline2_prediction[,"Estimate"] >= 0.5) * 1)
+
+write.csv(baseline2_solution, file = "baseline2.solution.csv", row.names = FALSE) # Test-Set: 0.75598
+```
+
+## Baseline 3
+
+```{r}
+baseline3_df <- baseline2_df
+
+#baseline3_formula <- bf(Survived ~ Pclass + Embarked + AgeBin*Sex + Title + SibSp + Parch + FareBin + Deck)
+baseline3_formula <- bf(Survived ~ Pclass + Embarked + AgeBin*Sex + Title + SibSp + Parch + LogFare + Deck)
+baseline3_fit <- brm(
+  baseline3_formula,
+  data = baseline3_df[ITrain,],
+  family = bernoulli(),
+  iter = 2000
+  # max_treedepth = 15
+)
+baseline3_evaluation <- evaluate_brms_model(baseline3_fit)
+baseline3_fit
+baseline3_evaluation
+
+baseline3_prediction <- predict(baseline3_fit, newdata=baseline3_df[ITest,])
+baseline3_solution <- data.frame(PassengerId = all_df[ITest,]$PassengerId, Survived=(baseline3_prediction[,"Estimate"] >= 0.5) * 1)
+
+write.csv(baseline3_solution, file = "baseline3.solution.csv", row.names = FALSE) # Test-Set: 0.74401
+```
+
+## Baseline 4 (GPs, TPs)
+
+```{r}
+baseline4_df <- baseline3_df
+baseline4_df[,c("Pclass", "Sex")] <- lapply(baseline4_df[,c("Pclass", "Sex")], FUN=as.numeric)
+baseline4_df[,c("Deck")] <- as.numeric(all_df$Deck)
+baseline4_df[is.na(baseline4_df$Deck),"Deck"] <- mean(baseline4_df$Deck, na.rm = TRUE)
+baseline4_df$Title <- as.numeric(factor(baseline4_df$Title))
+
+results <- rbind(
+  #evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, bs = "tp"), baseline4_df),
+  #evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, bs = "tp"), baseline4_df),
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, LogFare, bs = "tp"), baseline4_df),
+  #evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, bs = "tp", k=400), baseline4_df),
+  #evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, bs = "tp", k=400), baseline4_df),
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, LogFare, bs = "tp", k=400), baseline4_df)
+)
+results
+
+results <- rbind(
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, bs = "gp", k = 50), baseline4_df),
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, bs = "gp", k = 50), baseline4_df),
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, bs = "gp", k = 50), baseline4_df),
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, LogFare, bs = "gp", k = 50), baseline4_df)
+)
+results
+
+results <- rbind(
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, bs = "gp", k = 40), baseline4_df),
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, bs = "gp", k = 50), baseline4_df),
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, bs = "gp", k = 60), baseline4_df), # Best
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, bs = "gp", k = 70), baseline4_df),
+  evaluate_gam_formula(Survived ~ s(Pclass, AgeImputed, Sex, SibSp + Parch, Deck, bs = "gp", k = 80), baseline4_df)
+)
+results
+
+#baseline3_formula <- bf(Survived ~ Pclass + Embarked + AgeBin*Sex + Title + SibSp + Parch + FareBin + Deck)
+baseline4_formula <- bf(Survived ~ gp(Pclass, AgeImputed, Sex, k = 15)) # , LogFare, Deck, iso = FALSE
+baseline4_fit <- brm(
+  baseline4_formula,
+  data = baseline4_df[ITrain,],
+  family = bernoulli(),
+  iter = 2000
+)
+baseline4_evaluation <- evaluate_brms_model(baseline3_fit)
+baseline4_fit
+baseline4_evaluation
+```
