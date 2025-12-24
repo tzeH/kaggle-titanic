@@ -1,10 +1,10 @@
 ---
 title: "R Notebook"
 output:
+  pdf_document: default
+  html_notebook: default
   html_document:
     df_print: paged
-  html_notebook: default
-  pdf_document: default
 ---
 
 Welcome to my Titanic notebook. I have two Points to try here:
@@ -20,10 +20,15 @@ Full credit for that goes to all the other participants.
 library(brms) # Bayesian
 library(mgcv) # Non-Bayesian
 library(parallelly)
+library(ggplot2)
+library(dplyr)
 
 options(
   mc.cores = availableCores()
 )
+
+#library(future)
+#plan(multisession, workers = 5)
 
 ```
 
@@ -43,6 +48,7 @@ evaluate_brms_model <- function(fit) {
     #fit_loo$estimates, 
     fit_kfold$estimates, data.frame(Estimate=fit_accuracy, SE=NA, row.names = "accuracy_kfold"), data.frame(Estimate=fit_full_accuracy, SE=NA, row.names = "accuracy"))
 }
+
 
 evaluate_gam_formula <- function(formula, data) {
   train_df <- data[ITrain, ]
@@ -91,6 +97,78 @@ write_gam_solution <- function(formula, full_data, filename) {
   
   write.csv(fit_solution, file = filename, row.names = FALSE)
 }
+
+
+predict_mean <- function(fit) {
+  if (inherits(fit, "brmsfit")) {
+    # brms: posterior mean on response scale
+    preds <- fitted(fit, scale = "response")
+    return(preds[, "Estimate"])
+  }
+  if (inherits(fit, "gam")) {
+    # mgcv: response scale
+    return(predict(fit, type = "response"))
+  }
+  # --- projpred projection ---
+  if (inherits(fit, "projection")) {
+    return( colMeans(proj_linpred(fit, transform=TRUE)$pred) )
+  }
+  stop("Unsupported model class")
+}
+model_fit_data <- function(fit) {
+  if (inherits(fit, "brmsfit")) {
+    return(fit_refit$data)
+  }
+  if (inherits(fit, "gam")) {
+    return(fit$model)
+  }
+  if (inherits(fit, "projection")) {
+    return( fit$refmodel$fetch_data() )
+  }
+  stop("Unsupported model class")
+}
+
+analyze_fit <- function(fit) {
+  data_df <- cbind(model_fit_data(fit), Prediction=predict_mean(fit)) %>%
+    mutate(
+      Survived = factor(Survived > 0.5, levels = c(TRUE, FALSE)),
+      PredictionBin = factor(Prediction > 0.5, levels = c(FALSE, TRUE))
+    ) 
+  
+  plot_df <- data_df %>% count(Survived, PredictionBin)
+  
+  accuracy <- mean(data_df$Survived == data_df$PredictionBin)
+  likelihood <- 0 #logLik(fit) # funzt nicht für projected
+  
+  library(pROC)
+  roc_obj <- roc(response = data_df$Survived, predictor = data_df$Prediction)
+  
+  print(
+    plot(
+      roc_obj,
+      col = "#1565c0",
+      lwd = 3,
+      main = sprintf("ROC curve (AUC = %.3f)", auc(roc_obj)),
+      sub = deparse(fit$formula)
+    )
+    #abline(a = 0, b = 1, lty = 2, col = "grey")
+  )
+  
+  ggplot(plot_df, aes(x=Survived, y=PredictionBin, fill=n)) + geom_tile() + geom_text(aes(label = n), size = 6, fontface = "bold") +
+    scale_fill_gradient(low = "#e3f2fd", high = "#1565c0") +   theme_minimal(base_size = 13) + 
+    labs( x = "True outcome (Survived)", y = "Predicted outcome",
+          title = paste0("Confusion Matrix, ", round(100*accuracy,1), "% Acc, ", round(likelihood), " l.Lik. ", round(auc(roc_obj)*100,1)," AUC"), subtitle = deparse(fit$formula))
+}
+
+scale_df <- function(df) {
+  df %>%
+    mutate(
+      across(
+        where(is.numeric) & !all_of("Survived"),
+        ~ as.numeric(scale(.x))
+      )
+    )
+}
 ```
 
 # Feature Engineering
@@ -122,7 +200,6 @@ all_df$Sex <- factor(all_df$Sex, levels=sex_levels)
 pclass_levels <- c("First", "Second", "Third")
 all_df$Pclass <- factor(all_df$Pclass, labels = pclass_levels)
 
-
 rbind(
   evaluate_gam_formula(Survived ~ 1, all_df),
   evaluate_gam_formula(Survived ~ Sex, all_df),
@@ -144,13 +221,13 @@ all_df$Title[is.na(all_df$Title)] <- "Other"
 
 # Careful to not use Test-Data, here as well
 all_df$Surname <- substring(all_df[, c("Name")],0,regexpr(",",all_df[, c("Name")])-1)
-all_df$Surname <- gsub("[ -]", "_", all_df$Surname)
+all_df$Surname <- gsub("[ '\\-]", "_", all_df$Surname)
 
-surname_levels <- all_df$Surname
+surname_levels <- all_df$Surname[ITrain]
 surname_levels <- unique(surname_levels[ ave(ITrain, surname_levels, FUN=length) > 1 ])
 surname_levels <- c("Other", surname_levels)
 
-all_df$Surname <- factor(substring(all_df[, c("Name")],0,regexpr(",",all_df[, c("Name")])-1), levels=surname_levels)
+all_df$Surname <- factor(all_df$Surname, levels=surname_levels)
 all_df$Surname[is.na(all_df$Surname)] <- "Other"
 
 rbind(
@@ -185,15 +262,25 @@ Sometimes we have multiple Cabins in one Strings. In these cases, the first one 
 
 ```{r}
 all_df$LastCabin <- substring(all_df$Cabin,regexpr(" [^ ]+$",all_df$Cabin)+1,length(all_df$Cabin)-1)
+all_df$CabinUnknown <- as.numeric(all_df$Cabin == "")
 
 deck_levels <- c("A", "B", "C", "D", "E", "F", "G", "T")
 all_df$Deck <- factor(substr(all_df$LastCabin,0,1), levels=deck_levels)
 all_df$CabinNr <- as.numeric(substring(all_df$LastCabin,2))
-all_df$CabinSide <- all_df$CabinNr %% 2
+all_df$CabinSide <- (all_df$CabinNr %% 2) * 2
+
+all_df$DeckOrUnknown <- factor(all_df$Deck, levels=c("Unknown", deck_levels))
+all_df$DeckOrUnknown[is.na(all_df$DeckOrUnknown)] <- "Unknown"
+all_df$CabinSideOrZero <- all_df$CabinSide
+all_df$CabinSideOrZero[is.na(all_df$CabinSide)] <- 1
 
 # Deck schwierig, weil bei der cross-validation eingie Werte wegfallen
 # evaluate_gam_formula(Survived ~ Deck, all_df)
-evaluate_gam_formula(Survived ~ CabinNr + CabinSide, all_df)
+rbind(
+  evaluate_gam_formula(Survived ~ CabinNr + CabinSide, all_df),
+  evaluate_gam_formula(Survived ~ factor(CabinSideOrZero), all_df)
+)
+  
 ```
 
 ## Embarked Imputation
@@ -230,6 +317,8 @@ Binning makes sense, numerical age is useless then.
 
 ```{r}
 age_fit <- lm(formula = log(Age) ~ 0 + Title + Pclass + SibSp + Parch + Fare + Embarked + Sex, data = all_df[ITrain,])
+
+all_df$AgeUnknown <- is.na(all_df$Age)
 
 all_df$AgeImputed <- all_df$Age
 all_df$AgeImputed[is.na(all_df$Age)] <- exp(predict(age_fit, all_df[is.na(all_df$Age),]))
@@ -289,6 +378,169 @@ rbind(
   )
 ```
 
+# Linear Model Performance Analysis
+
+Let's see where linear models thrive and where they fail with these features.
+```{r}
+
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ 1))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ AgeImputed))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ s(AgeImputed)))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ AgeBin))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ s(AgeImputed, by=Sex)))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ AgeBin*Sex))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ AgeBin + Sex))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * AgeUnknown))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * Pclass))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * factor(SibSp)))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * factor(Parch)))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ s(Fare, by = Sex)))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * LogFare))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * FareBin))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * Embarked))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * Title))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * Surname))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * TicketPrefix))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * CabinUnknown))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * DeckOrUnknown))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * factor(CabinSideOrZero)))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * SoloTraveler))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * AdultWithInfant)) # hmm
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * AdultWithBoy))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * AdultWithTeenager))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * AdultWithOld))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * TicketTravelers))
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), Survived ~ Sex * Namesakes))
+
+
+formula_full <- Survived ~ Sex+s(AgeImputed, by=Sex)+AgeUnknown+Pclass+factor(SibSp)+factor(Parch)+s(Fare, by = Sex)+LogFare+FareBin+
+                      Embarked+Title+Surname+TicketPrefix+CabinUnknown+DeckOrUnknown+factor(CabinSideOrZero)+SoloTraveler+AdultWithInfant+AdultWithBoy+AdultWithTeenager+AdultWithOld+
+                      TicketTravelers+Namesakes
+formula_full2 <- Survived ~ Sex+s(AgeImputed)+AgeUnknown+Pclass+factor(SibSp)+factor(Parch)+s(Fare)+LogFare+FareBin+
+                      Embarked+Title+Surname+TicketPrefix+CabinUnknown+DeckOrUnknown+factor(CabinSideOrZero)+SoloTraveler+AdultWithInfant+AdultWithBoy+AdultWithTeenager+AdultWithOld+
+                      TicketTravelers+Namesakes
+
+
+analyze_fit(gam(data = all_df[ITrain, ], family = binomial(link = "logit"), formula_full))
+
+fit_full <- brm(
+  formula_full,
+  data = all_df[ITrain, ],
+  family = bernoulli(),
+  iter = 2000,
+  silent = FALSE,
+  refresh = 100,
+  prior = prior(student_t(3, 0, 5), class = "b"),
+  control=list(max_treedepth=20)
+)
+fit_reg <- brm(
+  formula_full,
+  data = all_df[ITrain, ],
+  family = bernoulli(),
+  iter = 2000,
+  silent = FALSE,
+  refresh = 100,
+  prior = prior(horseshoe(), class = "b")
+)
+fit_reg2 <- brm(
+  formula_full2,
+  data = all_df[ITrain, ],
+  family = bernoulli(),
+  iter = 2000,
+  silent = FALSE,
+  refresh = 100,
+  prior = prior(horseshoe(), class = "b")
+)
+
+analyze_fit(fit_full)
+analyze_fit(fit_reg)
+
+library(projpred)
+vs <- varsel( # DAS DAUERT!
+  fit_reg2,
+  method = "forward",
+  nterms_max = 10
+)
+plot(vs)
+size <- suggest_size(vs, stat = "elpd", se = 1)
+size
+fit_reduced <- project(vs, size = size)
+selected_terms <- solution_terms(vs, size = size)
+selected_terms
+selected_formula <- reformulate(selected_terms, response = "Survived")
+fit_refit <- brm(
+  selected_terms,
+  data = all_df[ITrain,],
+  family = bernoulli(),
+  prior = prior(horseshoe(), class = "b")
+)
+fit_refit2 <- brm(
+  selected_terms,
+  data = all_df[ITrain,],
+  family = bernoulli(),
+  prior = prior(student_t(3, 0, 5), class = "b") # less regularization
+)
+fit_refit_gam <- gam(selected_formula, data = scale_df(all_df[ITrain, ]), family = binomial(link = "logit"))
+fit_refit_gam2 <- gam(selected_formula, data = scale_df(all_df[ITrain, ]), family = binomial(link = "logit"), select = TRUE)
+fit_refit_gam3 <- gam(selected_formula, data = scale_df(all_df[ITrain, ]), family = binomial(link = "logit"), method = "REML")
+
+analyze_fit(fit_reduced)
+analyze_fit(fit_refit)
+analyze_fit(fit_refit_gam)
+analyze_fit(fit_refit_gam2)
+analyze_fit(fit_refit_gam3)
+
+```
+Compare brms and gam coefficients
+
+```{r}
+library(tibble)
+brms_coef <- fixef(fit_refit) |>
+  as.data.frame() |>
+  rownames_to_column("term") |>
+  transmute(
+    term,
+    brms_est = Estimate,
+    brms_se  = Est.Error
+  )
+
+# --- gam ---
+gam_sum <- summary(fit_refit_gam3)
+
+gam_coef <- gam_sum$p.table |>
+  as.data.frame() |>
+  rownames_to_column("term") |>
+  transmute(
+    term,
+    gam_est = Estimate,
+    gam_se  = `Std. Error`
+  )
+
+coef_compare <- full_join(brms_coef, gam_coef, by = "term") |>
+  mutate(
+    diff = brms_est - gam_est,
+    abs_diff = abs(diff)
+  )
+
+coef_compare
+
+ggplot(coef_compare, aes(x = gam_est, y = brms_est)) +
+  geom_point(size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_text(aes(label = term), hjust = -0.1, size = 3) +
+  labs(
+    x = "GAM coefficient",
+    y = "brms coefficient",
+    title = "Coefficient comparison (brms vs GAM)"
+  ) +
+  theme_minimal()
+
+conditional_effects(fit_refit, "AgeImputed")
+plot(fit_refit_gam3, select = 1)
+```
+
+
 # Feature Selection
 
 LASSO-Implementation acc. to https://rpubs.com/Momo2019/1184100
@@ -306,16 +558,23 @@ lasso.features = c("Pclass", "AgeImputed", "Fare", "LogFare", "Sex",
 lasso.X <- transform(all_df[,lasso.features], Sex=as.numeric(Sex), Pclass=as.numeric(Pclass))
 lasso.y <- all_df[,c("Survived")]
 
+myDummyCode <- function(column) {
+  dummyEncoded <- dummy.code(all_df[,column], )
+  colnames(dummyEncoded) <- paste0(column, "_", colnames(dummyEncoded))
+  dummyEncoded
+}
+
 # One-Hot encoded factors
 lasso.X <- cbind(
   lasso.X,
-  dummy.code(all_df[,"AgeBin"], ),
-  dummy.code(all_df[,"FareBin"], ),
-  dummy.code(all_df[,"Embarked"], ),
-  dummy.code(all_df[,"Title"]),
-  dummy.code(all_df[,"Surname"]),
-  dummy.code(all_df[,"AgeBin"]),
-  dummy.code(all_df[,"TicketPrefix"])
+  myDummyCode("AgeBin"),
+  myDummyCode("FareBin"),
+  myDummyCode("Embarked"),
+  myDummyCode("Title")[,-5],
+  myDummyCode("Surname")[,-1],
+  myDummyCode("TicketPrefix")[,-1],
+  # worse: myDummyCode("CabinSideOrZero")[,c("CabinSideOrZero_0", "CabinSideOrZero_2")],
+  myDummyCode("DeckOrUnknown")
 )
 
 cv.lasso = cv.glmnet(as.matrix(lasso.X[ITrain,]), as.matrix(lasso.y[ITrain]), alpha=1)
@@ -329,15 +588,161 @@ lasso.selected <- rownames(lasso.coefs)[as.numeric(lasso.coefs) != 0.0]
 
 lasso.coefs
 
-f <- as.formula(
+lasso.f <- as.formula(
   paste("Survived ~ ", paste(ifelse(lasso.selected == "(Intercept)", "1", lasso.selected), collapse = " + "))
 )
 
 lasso.gam_df <- cbind(Survived=lasso.y, all_df[, c("kfold", "PassengerId")], lasso.X)
 
-evaluate_gam_formula(f, lasso.gam_df[ITrain,])
+evaluate_gam_formula(lasso.f, lasso.gam_df[ITrain,])
 
-write_gam_solution(f, lasso.gam_df, "lasso.solution.csv") # 0.77751 (0.76555 ohne lambda * 3)
+write_gam_solution(lasso.f, lasso.gam_df, "lasso.solution.csv") # 0.78468
+
+```
+
+## PCA
+
+```{r}
+
+pca.data <- scale(lasso.X)
+pca.components <- princomp(pca.data)
+summary(pca.components)
+plot(pca.components$sdev)
+
+for(i in seq(5)) {
+  tmp_loading <- pca.components$loadings[, i]
+  tmp_loading <- tmp_loading[order(abs(tmp_loading), decreasing = TRUE)[1:5]]
+  print(data.frame(setNames(list(tmp_loading), paste0("pca", i))))
+  
+  print(
+    ggplot(data.frame(pca = pca.components$scores[ITrain,i], Survived = factor(lasso.y[ITrain])), aes(x=pca)) +
+      geom_density(aes(group=Survived, col=Survived))
+  )
+}
+
+```
+
+## ICA
+
+```{r}
+
+# install.packages("fastICA")
+library(fastICA)
+
+ica.data <- lasso.X[ITrain,]
+ica.estimation <- fastICA(ica.data, 5, alg.typ = "parallel", fun = "logcosh", alpha = 1, method = "C", row.norm = FALSE, maxit = 200, tol = 0.0001, verbose = TRUE)
+
+for(i in seq(5)) {
+  print(
+    ggplot(data.frame(ica = ica.estimation$S[,i], Survived = lasso.y[ITrain]), aes(x=ica)) +
+      geom_density(aes(group=Survived, col=Survived))
+  )
+}
+
+```
+
+## r-TSNE
+
+```{r}
+# install.packages("Rtsne")
+library(Rtsne)
+
+# Warum haben wir Dubletten??
+# duplicates <- rbind((lasso.X[ITrain,])[duplicated(lasso.X[ITrain,]),], (lasso.X[ITrain,])[duplicated(lasso.X[ITrain,], fromLast=TRUE),])
+# duplicates <- duplicates[order(duplicates$AgeImputed, duplicates$SibSp, duplicates$Parch),]
+# duplicates
+# all_df[rownames(duplicates),]
+
+tsne.data <- unique(lasso.X[ITrain,])
+tsne.results <- Rtsne(tsne.data, dims = 2, perplexity = 25, verbose = TRUE, max_iter = 1500)
+tsne.df <- data.frame(
+  X = tsne.results$Y[, 1],
+  Y = tsne.results$Y[, 2],
+  Sex = tsne.data$Sex,
+  Pclass = tsne.data$Pclass,
+  Survived = all_df[rownames(tsne.data),"Survived"]
+)
+colors <- c("#E6194B", "#3CB44B")
+
+ggplot(tsne.df, aes(x = X, y = Y, color = factor(Survived, levels=c(1,2)))) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = colors) +
+  labs(
+    title = "t-SNE 2-Dimensional Digit Visualization",
+    x = "t-SNE Dimension 1",
+    y = "t-SNE Dimension 2"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 20)
+  )
+
+```
+
+## Random Forest
+
+```{r}
+
+library(caret)
+
+ctrl <- rfeControl(
+  functions = lmFuncs, #rfFuncs,
+  method = "cv",
+  number = 5
+)
+
+rfe_fit <- rfe(
+  x = lasso.X[ITrain,],
+  y = lasso.y[ITrain],
+  sizes = c(5, 15, 30, 35, 40, 45, 50, 55, 75),
+  rfeControl = ctrl
+)
+
+rfe_fit$results
+
+rfe_fit$evaluation <- data.frame()
+for(s in rfe_fit$results$Variables ) {
+  rfe.attributes <- unique(rfe_fit$variables[rfe_fit$variables$Variables == s,]$var)
+  rfe.attributes
+  rfe.f <- as.formula(
+    paste("Survived ~ ", paste(rfe.attributes, collapse = " + "))
+  )
+  rfe.gam_df <- cbind(Survived=lasso.y, all_df[, c("kfold", "PassengerId")], lasso.X)
+  
+  rfe_fit$evaluation <- rbind(rfe_fit$evaluation, evaluate_gam_formula(rfe.f, rfe.gam_df[ITrain,]))
+  
+  write_gam_solution(rfe.f, rfe.gam_df, paste0("rfe.",s,".solution.csv"))
+}
+rfe_fit$evaluation
+
+# rfe.35.solution.csv: 0.77751
+```
+
+
+## Boruta
+
+```{r}
+
+library(Boruta)
+
+set.seed(123)
+
+boruta <- Boruta(
+  reformulate(colnames(lasso.X), response = "Survived"),
+  data = cbind(Survived = lasso.y, lasso.X)[ITrain,],
+  doTrace = 1
+)
+
+boruta
+boruta.attributes <- getSelectedAttributes(boruta, withTentative = FALSE)
+boruta.f <- as.formula(
+  paste("Survived ~ ", paste(boruta.attributes, collapse = " + "))
+)
+
+boruta.gam_df <- cbind(Survived=lasso.y, all_df[, c("kfold", "PassengerId")], lasso.X)
+evaluate_gam_formula(boruta.f, boruta.gam_df[ITrain,])
+write_gam_solution(boruta.f, boruta.gam_df, "boruta.solution.csv")
+
 
 ```
 
@@ -345,10 +750,33 @@ write_gam_solution(f, lasso.gam_df, "lasso.solution.csv") # 0.77751 (0.76555 ohn
 
 Here we use all the simple Features in a bayesian regression model to establish a baseline:
 
-```{r}
-library(future)
-plan(multisession, workers = 5)
+## Baseline Rnadom Forest
 
+```{r}
+
+# install.packages("ranger")
+library(ranger)
+
+set.seed(123)
+
+rf_fit <- ranger(
+  Survived ~ Pclass + AgeImputed + Fare + LogFare + Sex + SibSp + Parch + SoloTraveler + AdultWithInfant + AdultWithBoy + AdultWithTeenager + AdultWithOld + TicketTravelers + Namesakes +
+    AgeBin + FareBin + Embarked + Title + Surname + TicketPrefix,
+  data = all_df[ITrain,],
+  num.trees = 500,
+  mtry = floor(sqrt(ncol(all_df) - 1)),
+  min.node.size = 5,
+  probability = TRUE,          # for class probabilities
+  importance = "permutation"
+)
+imp <- sort(rf_fit$variable.importance, decreasing = TRUE)
+barplot(
+  imp,
+  horiz = TRUE,
+  las = 1,
+  main = "Permutation importance"
+)
+data.frame(imp)
 
 ```
 
@@ -462,14 +890,15 @@ results <- rbind(
 results
 
 #baseline3_formula <- bf(Survived ~ Pclass + Embarked + AgeBin*Sex + Title + SibSp + Parch + FareBin + Deck)
-baseline4_formula <- bf(Survived ~ gp(Pclass, AgeImputed, Sex, k = 15)) # , LogFare, Deck, iso = FALSE
-baseline4_fit <- brm(
-  baseline4_formula,
-  data = baseline4_df[ITrain,],
-  family = bernoulli(),
-  iter = 2000
-)
-baseline4_evaluation <- evaluate_brms_model(baseline3_fit)
-baseline4_fit
-baseline4_evaluation
+# baseline4_formula <- bf(Survived ~ gp(Pclass, AgeImputed, Sex, k = 15)) # , LogFare, Deck, iso = FALSE
+# baseline4_fit <- brm(
+#   baseline4_formula,
+#   data = baseline4_df[ITrain,],
+#   family = bernoulli(),
+#   iter = 2000
+# )
+# baseline4_evaluation <- evaluate_brms_model(baseline3_fit)
+# baseline4_fit
+# baseline4_evaluation
 ```
+# The End
